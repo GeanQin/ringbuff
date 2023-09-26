@@ -8,22 +8,41 @@
 
 static ringbuff_t ringbuff[RINGBUFF_COUNT_MAX];
 static ringbuff_client_t ringbuff_client[RINGBUFF_CLIENT_COUNT_MAX];
-
-static int8_t get_item_info(int8_t to_before, ringbuff_item_info_t *item_info, uint8_t *read_p, ringbuff_fd fd)
+static u_int64_t write_seq[RINGBUFF_COUNT_MAX];
+static u_int64_t pre_read_seq[RINGBUFF_CLIENT_COUNT_MAX];
+static int8_t get_item_info(int8_t to_before, ringbuff_item_info_t *item_info, uint8_t *read_p, ringbuff_fd fd, ringbuff_read_fd read_fd)
 {
     int i = 0;
     int64_t remain_len = 0;
     u_int8_t *ringbuff_end_p = NULL;
     u_int8_t *item_head = (u_int8_t *)item_info;
-    static u_int64_t pre_read_seq = 0;
+
+    if (read_p == NULL)
+    {
+        fprintf(stderr, "[%s]read_p is NULL\n", __func__);
+        return -1;
+    }
+
+    if (read_p == ringbuff[fd].write_p)
+    {
+        // fprintf(stderr, "[%s]read_p == write_p, wait....\n", __func__);
+        return -1;
+    }
 
     ringbuff_end_p = ringbuff[fd].ringbuff_p + ringbuff[fd].ringbuff_size;
     remain_len = ringbuff_end_p - read_p;
+    
     if (remain_len <= sizeof(ringbuff_item_info_t))
     {
         // printf("[%s]splice item_info! read_p=%p remain_len=%ld\n", __func__, read_p, remain_len);
         memcpy(item_head, read_p, remain_len);
         memcpy(item_head + remain_len, ringbuff[fd].ringbuff_p, sizeof(ringbuff_item_info_t) - remain_len);
+        printf("=================back====================\n");
+        printf("p len=%ld\n", item_info->data_size);
+        printf("p pre_len=%ld\n", item_info->pre_data_size);
+        printf("p separator=[0x%02x, 0x%02x]\n", item_info->separator[0], item_info->separator[7]);
+        printf("p seq=%lu\n", item_info->seq);
+        printf("=======================================\n");
     }
     else
     {
@@ -32,16 +51,19 @@ static int8_t get_item_info(int8_t to_before, ringbuff_item_info_t *item_info, u
 
     if (item_info->data_info_p > ringbuff_end_p || ringbuff_end_p < ringbuff[fd].ringbuff_p)
     {
+        fprintf(stderr, "[%s]read_p err\n", __func__);
         return -1;
     }
 
     if (item_info->data_size < 0 || item_info->data_size + sizeof(ringbuff_item_info_t) > ringbuff[fd].ringbuff_size)
     {
+        fprintf(stderr, "[%s]data size err\n", __func__);
         return -1;
     }
 
     if (item_info->pre_data_size < 0 || item_info->pre_data_size + sizeof(ringbuff_item_info_t) > ringbuff[fd].ringbuff_size)
     {
+        fprintf(stderr, "[%s]last data size err\n", __func__);
         return -1;
     }
 
@@ -49,24 +71,33 @@ static int8_t get_item_info(int8_t to_before, ringbuff_item_info_t *item_info, u
     {
         if (item_info->separator[i] != 1)
         {
+            fprintf(stderr, "[%s]separator is not 11111111\n", __func__);
             return -1;
         }
     }
 
+#if 0
+    printf("=======================================\n");
+    printf("ringbuff%d\n", fd);
+    printf("data_info_p: %p\n", item_info->data_info_p);
+    printf("data_size: %lu\n", item_info->data_size);
+    printf("pre_data_size: %lu\n", item_info->pre_data_size);
+    printf("seq: %lu\n", item_info->seq);
+    printf("separator[0]: %02x\n", item_info->separator[0]);
+    printf("separator[7]: %02x\n", item_info->separator[7]);
+    printf("=======================================\n");
+#endif
+
     // 防止读到之前的数据了
     if (to_before == 0)
     {
-        // printf("pre_seq=%lu, now_seq=%lu\n", pre_read_seq, item_info->seq);
-        if (item_info->seq < pre_read_seq)
+        if (item_info->seq != 0 && item_info->seq < pre_read_seq[read_fd])
         {
+            fprintf(stderr, "[%s]have read before data\n", __func__);
             return -1;   
         }
-        pre_read_seq = item_info->seq;
+        pre_read_seq[read_fd] = item_info->seq;
     }
-
-    printf("[%s]data_info_p=%p, data_size=%lu, pre_data_size=%lu, separator=[%d,%d], seq=%lu\n", __func__,
-           item_info->data_info_p, item_info->data_size, item_info->pre_data_size, 
-           item_info->separator[0], item_info->separator[7], item_info->seq);
 
     return 0;
 }
@@ -110,7 +141,14 @@ ringbuff_fd ringbuff_init(char *ringbuff_tag, int64_t size)
     memset(ringbuff[use_index].last_item->separator, 1, sizeof(ringbuff[use_index].last_item->separator));
     ringbuff[use_index].write_p = ringbuff[use_index].ringbuff_p;
     pthread_mutex_init(&(ringbuff[use_index].ringbuff_lock), NULL);
+    write_seq[use_index] = 0;
     ringbuff[use_index].have_init = 1;
+
+    printf("==============================================\n");
+    printf("[%s] use %d\n", __func__, use_index);
+    printf("[%s] ringbuff_p=%p\n", __func__, ringbuff[use_index].ringbuff_p);
+    printf("[%s] ringbuff_end_p=%p\n", __func__, ringbuff[use_index].ringbuff_p + size);
+    printf("==============================================\n");
 
     return use_index;
 }
@@ -122,8 +160,8 @@ ringbuff_fd ringbuff_get_fd(char *ringbuff_tag)
 
     for (i = 0; i < RINGBUFF_COUNT_MAX; i++)
     {
-        if (ringbuff[index].have_init == 1 &&
-            strncmp(ringbuff_tag, ringbuff[index].ringbuff_tag, strlen(ringbuff_tag) + 1) == 0)
+        if (ringbuff[i].have_init == 1 &&
+            strncmp(ringbuff_tag, ringbuff[i].ringbuff_tag, strlen(ringbuff_tag) + 1) == 0)
         {
             index = i;
             break;
@@ -153,21 +191,27 @@ void ringbuff_reset(ringbuff_fd fd)
     pthread_mutex_unlock(&(ringbuff[fd].ringbuff_lock));
 }
 
+/**
+ * |头|数据|
+ * 头：记录数据位置
+ * 数据：任意数据
+ */
 int64_t ringbuff_put(ringbuff_fd fd, u_int8_t *data, int64_t data_len)
 {
     u_int8_t *ringbuff_end_p = NULL;
     u_int8_t *item_head = NULL;
     int64_t remain_size = 0;
     int64_t write_len = 0;
-    static u_int64_t write_seq = 0;
 
     if (ringbuff[fd].have_init == 0)
     {
+        fprintf(stderr, "[%s] ringbuff%d is not init\n", __func__, fd);
         return RINGBUFF_DO_NOT_INIT;
     }
 
     if (data_len + sizeof(ringbuff_item_info_t) > ringbuff[fd].ringbuff_size)
     {
+        fprintf(stderr, "[%s] ringbuff%d is not enough\n", __func__, fd);
         return RINGBUFF_INPUT_DATA_ERR;
     }
 
@@ -186,7 +230,7 @@ int64_t ringbuff_put(ringbuff_fd fd, u_int8_t *data, int64_t data_len)
     ringbuff[fd].last_item->pre_data_size = ringbuff[fd].last_item->data_size;
     ringbuff[fd].last_item->data_size = data_len;
     ringbuff[fd].last_item->data_info_p = ringbuff[fd].write_p;
-    ringbuff[fd].last_item->seq = write_seq;
+    ringbuff[fd].last_item->seq = write_seq[fd];
     memset(ringbuff[fd].last_item->separator, 1, sizeof(ringbuff[fd].last_item->separator));
     item_head = (u_int8_t *)ringbuff[fd].last_item;
 
@@ -226,19 +270,33 @@ int64_t ringbuff_put(ringbuff_fd fd, u_int8_t *data, int64_t data_len)
     {
         write_len = ringbuff[fd].write_p - ringbuff[fd].last_item->data_info_p;
     }
-    write_seq++;
+    write_seq[fd]++;
+
+#if 0
+    printf("==========================\n");
+    printf("ringbuff idx=%d\n", fd);
+    printf("ringbuff start=%p\n", ringbuff[fd].ringbuff_p);
+    printf("ringbuff len=%ld\n", ringbuff[fd].ringbuff_size);
+    printf("ringbuff last pre_len=%ld\n", ringbuff[fd].last_item->pre_data_size);
+    printf("ringbuff last p=%p\n", ringbuff[fd].last_item->data_info_p);
+    printf("ringbuff last len=%ld\n", ringbuff[fd].last_item->data_size);
+    printf("ringbuff last seq=%llu\n", ringbuff[fd].last_item->seq);
+    printf("ringbuff w=%p\n", ringbuff[fd].write_p);
+    printf("ringbuff seq=%llu\n", write_seq[fd]);
+    printf("==========================\n");
+#endif
     pthread_mutex_unlock(&(ringbuff[fd].ringbuff_lock));
 
-    return write_len;
+    return write_len - sizeof(ringbuff_item_info_t);
 }
 
 void ringbuff_dump(ringbuff_fd fd)
 {
-    char filename[64] = {0};
+    char filename[512] = {0};
     FILE *fp = NULL;
 
     snprintf(filename, sizeof(filename), "ringbuff-%s-offset%lu",
-             ringbuff[fd].ringbuff_tag, ringbuff[fd].write_p - ringbuff[fd].ringbuff_p);
+             ringbuff[fd].ringbuff_tag, ringbuff[fd].last_item->data_info_p - ringbuff[fd].ringbuff_p);
 
     fp = fopen(filename, "w");
     if (fp == NULL)
@@ -291,7 +349,7 @@ ringbuff_read_fd ringbuff_read_init(ringbuff_fd fd, u_int32_t forward)
     ringbuff_client[use_index].read_p = ringbuff[fd].last_item->data_info_p;
     ringbuff_end_p = ringbuff[fd].ringbuff_p + ringbuff[fd].ringbuff_size;
 
-    if (get_item_info(1, &item_info, ringbuff_client[use_index].read_p, fd) < 0)
+    if (get_item_info(1, &item_info, ringbuff_client[use_index].read_p, fd, use_index) < 0)
     {
         err = RINGBUFF_READ_P_ERR;
         goto END;
@@ -324,7 +382,7 @@ ringbuff_read_fd ringbuff_read_init(ringbuff_fd fd, u_int32_t forward)
         {
             ringbuff_client[use_index].read_p -= sizeof(ringbuff_item_info_t);
         }
-        if (get_item_info(1, &item_info, ringbuff_client[use_index].read_p, fd) < 0)
+        if (get_item_info(1, &item_info, ringbuff_client[use_index].read_p, fd, use_index) < 0)
         {
             err = RINGBUFF_READ_P_ERR;
             goto END;
@@ -338,6 +396,7 @@ END:
         return err;
     }
 
+    pre_read_seq[use_index] = 0;
     ringbuff_client[use_index].in_use = 1;
     return use_index;
 }
@@ -349,7 +408,6 @@ int64_t ringbuff_read(ringbuff_read_fd fd, u_int8_t *buf, int64_t buf_size)
     int64_t remain_size = 0;
     u_int8_t *ringbuff_end_p = NULL;
     ringbuff_fd rb_fd = 0;
-    int64_t read_len = 0;
 
     rb_fd = ringbuff_client[fd].rb_fd;
     ringbuff_end_p = ringbuff[rb_fd].ringbuff_p + ringbuff[rb_fd].ringbuff_size;
@@ -361,21 +419,22 @@ int64_t ringbuff_read(ringbuff_read_fd fd, u_int8_t *buf, int64_t buf_size)
         goto END;
     }
 
-    if (get_item_info(0, &item_info, ringbuff_client[fd].read_p, rb_fd) < 0)
+    if (get_item_info(0, &item_info, ringbuff_client[fd].read_p, rb_fd, fd) < 0)
     {
         // 读不到就两种可能：数据还没写，或者被写指针踩掉了
         if (ringbuff_client[fd].read_p == ringbuff[rb_fd].write_p)
         {
-            // printf("[%s]wait write, read_p=%p, write_p=%p\n", __func__,
-            //        ringbuff_client[fd].read_p, ringbuff[rb_fd].write_p);
             err = RINGBUFF_READ_REACH_WRITE;
             goto END;
         }
         else
         {
-            // 指回写指针，丢掉的数据读不到就跳过
-            printf("[%s]write_p cover read_p, read_p=%p, write_p=%p\n", __func__,
-                   ringbuff_client[fd].read_p, ringbuff[rb_fd].write_p);
+            // 被覆盖，指回写指针，丢掉的数据读不到就跳过
+            fprintf(stderr, "ringbuff%d star_p(%p) end_p(%p)\n", rb_fd, ringbuff[rb_fd].ringbuff_p, ringbuff[rb_fd].ringbuff_p + ringbuff[rb_fd].ringbuff_size);
+            fprintf(stderr, "[%s]ringbuff%d, write_p(%p) cover read_p(%p), last_p(%p), last_last_p(%p)\n",
+                     __func__, rb_fd, ringbuff[rb_fd].write_p, ringbuff_client[fd].read_p, ringbuff[rb_fd].last_item->data_info_p, 
+                     ringbuff[rb_fd].last_item->data_info_p - ringbuff[rb_fd].last_item->pre_data_size - sizeof(ringbuff_item_info_t));
+
             ringbuff_client[fd].read_p = ringbuff[rb_fd].write_p;
             err = RINGBUFF_READ_P_ERR;
             goto END;
@@ -389,6 +448,7 @@ int64_t ringbuff_read(ringbuff_read_fd fd, u_int8_t *buf, int64_t buf_size)
         goto END;
     }
 
+    // read_p向前推过头部ringbuff_item_info_t
     remain_size = ringbuff_end_p - ringbuff_client[fd].read_p;
     if (remain_size <= sizeof(ringbuff_item_info_t))
     {
@@ -402,7 +462,7 @@ int64_t ringbuff_read(ringbuff_read_fd fd, u_int8_t *buf, int64_t buf_size)
     remain_size = ringbuff_end_p - ringbuff_client[fd].read_p;
     if (remain_size <= item_info.data_size)
     {
-        memcpy(buf, ringbuff_client[fd].read_p + sizeof(ringbuff_item_info_t), remain_size);
+        memcpy(buf, ringbuff_client[fd].read_p, remain_size);
         memcpy(buf + remain_size, ringbuff[rb_fd].ringbuff_p, item_info.data_size - remain_size);
         ringbuff_client[fd].read_p = ringbuff[rb_fd].ringbuff_p + item_info.data_size - remain_size;
     }
@@ -411,23 +471,21 @@ int64_t ringbuff_read(ringbuff_read_fd fd, u_int8_t *buf, int64_t buf_size)
         memcpy(buf, ringbuff_client[fd].read_p, item_info.data_size);
         ringbuff_client[fd].read_p += item_info.data_size;
     }
-
-    // 套圈
-    if (item_info.data_info_p >= ringbuff_client[fd].read_p)
-    {
-        read_len = ringbuff_end_p - item_info.data_info_p + ringbuff_client[fd].read_p - ringbuff[fd].ringbuff_p;
-    }
-    else
-    {
-        read_len = ringbuff_client[fd].read_p - item_info.data_info_p;
-    }
+#if 0
+    printf("=================read====================\n");
+    printf("p len=%ld\n", item_info.data_size);
+    printf("p pre_len=%ld\n", item_info.pre_data_size);
+    printf("p separator=[0x%02x, 0x%02x]\n", item_info.separator[0], item_info.separator[7]);
+    printf("p seq=%lu\n", item_info.seq);
+    printf("=======================================\n");
+#endif
 END:
     pthread_mutex_unlock(&(ringbuff[rb_fd].ringbuff_lock));
     if (err < 0)
     {
         return err;
     }
-    return read_len;
+    return item_info.data_size;
 }
 
 void ringbuff_read_deinit(ringbuff_fd fd)

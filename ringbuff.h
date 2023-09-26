@@ -41,7 +41,7 @@ typedef struct
 
 typedef struct
 {
-    char ringbuff_tag[16];
+    char ringbuff_tag[64];
     u_int8_t have_init;
     u_int8_t *ringbuff_p;
     int64_t ringbuff_size;

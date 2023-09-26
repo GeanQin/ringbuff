@@ -100,10 +100,10 @@ static void *data_get(void *arg)
     while (1)
     {
         get_len = ringbuff_read(client_fd, data, sizeof(data));
-        if (get_len > sizeof(ringbuff_item_info_t) && get_len < RINGBUFF_SIZE - sizeof(ringbuff_item_info_t))
+        if (get_len > 0 && get_len < RINGBUFF_SIZE)
         {
-            // fwrite(data, 1, get_len - sizeof(ringbuff_item_info_t), fp);
-            // fflush(fp);
+            fwrite(data, 1, get_len, fp);
+            fflush(fp);
         }
         usleep(10 * 1000);
     }
@@ -149,7 +149,7 @@ int main()
         if (get_one_ADTS_frame(input_data, input_data_len, frame, &frame_len) == 0)
         {
             ringbuff_write_len = ringbuff_put(fd, frame, frame_len);
-            if (ringbuff_write_len != frame_len + sizeof(ringbuff_item_info_t))
+            if (ringbuff_write_len != frame_len)
             {
                 printf("ringbuff_put err, write_len=%lu, data_len=%lu\n", ringbuff_write_len, frame_len);
                 ringbuff_dump(fd);
